@@ -1,0 +1,84 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: helloworld-app
+  namespace: xff-test
+data:
+  app.js: |
+    // Minimal zero-dependency HTTP server. Instana's AutoTrace webhook injects
+    // the @instana/collector automatically (no code change needed), and with
+    // INSTANA_EXTRA_HTTP_HEADERS the X-Forwarded-For header is attached to the
+    // HTTP entry span -> that is how the client IP shows up in the Instana trace.
+    const http = require('http');
+    const os = require('os');
+
+    const server = http.createServer((req, res) => {
+      const xff = req.headers['x-forwarded-for'] || null;
+      const body = {
+        service: 'helloworld',
+        pod: os.hostname(),
+        method: req.method,
+        url: req.url,
+        // What the TCP socket sees (this is the Apache pod, NOT the real client)
+        socketRemoteAddress: req.socket.remoteAddress,
+        // What the proxy chain forwarded. First entry = real client.
+        xForwardedFor: xff,
+        clientIp: xff ? xff.split(',')[0].trim() : req.socket.remoteAddress,
+        xRealIp: req.headers['x-real-ip'] || null,
+        headers: req.headers,
+      };
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body, null, 2) + '\n');
+    });
+
+    server.listen(3000, () => console.log('helloworld listening on :3000'));
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: helloworld
+  namespace: xff-test
+  labels: { app: helloworld }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: helloworld }
+  template:
+    metadata:
+      labels: { app: helloworld }
+    spec:
+      containers:
+        - name: helloworld
+          image: node:20-alpine
+          command: ["node", "/app/app.js"]
+          ports:
+            - containerPort: 3000
+          env:
+            # ---- KEY for Instana: capture these request headers onto the span ----
+            # Semicolon-separated. X-Forwarded-For carries the real client IP that
+            # the Apache proxy forwarded. This makes "client IP" visible & filterable
+            # in the Instana trace view.
+            - name: INSTANA_EXTRA_HTTP_HEADERS
+              value: "x-forwarded-for;x-real-ip;x-forwarded-proto;forwarded"
+            - name: INSTANA_SERVICE_NAME
+              value: "helloworld"
+          volumeMounts:
+            - name: app
+              mountPath: /app
+      volumes:
+        - name: app
+          configMap:
+            name: helloworld-app
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: helloworld
+  namespace: xff-test
+  labels: { app: helloworld }
+spec:
+  selector: { app: helloworld }
+  ports:
+    - name: http
+      port: 3000
+      targetPort: 3000

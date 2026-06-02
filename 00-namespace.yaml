@@ -1,0 +1,10 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: xff-test
+  labels:
+    name: xff-test
+    # Instana AutoTrace webhook instruments every namespace that is NOT on its
+    # exclusion list, so this namespace is auto-instrumented by just existing.
+    # These labels make the intent explicit.
+    instana-autotrace: "true"

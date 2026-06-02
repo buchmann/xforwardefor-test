@@ -1,0 +1,113 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: apache-conf
+  namespace: xff-test
+data:
+  # This file is Include- d at the end of the stock httpd.conf (see the Deployment
+  # command). It contains THE settings that make the real client IP visible in
+  # the Instana trace when Apache sits behind a load balancer.
+  proxy-xff.conf: |
+    # --- 1. Load the modules we need (all ship with the httpd:2.4 image, off by default) ---
+    LoadModule proxy_module        modules/mod_proxy.so
+    LoadModule proxy_http_module   modules/mod_proxy_http.so
+    LoadModule remoteip_module     modules/mod_remoteip.so
+    LoadModule headers_module      modules/mod_headers.so
+
+    # ============================================================================
+    #  THE KEY SETTING  --  mod_remoteip
+    # ----------------------------------------------------------------------------
+    #  The load balancer terminates the client's TCP connection, so without this
+    #  Apache thinks the *load balancer* is the client. mod_remoteip tells Apache:
+    #  "trust the X-Forwarded-For header coming from these upstream proxies, and
+    #   treat the left-most untrusted address in it as the REAL client."
+    #
+    #  After this runs, Apache's internal client IP (r->useragent_ip / %a / the
+    #  REMOTE_ADDR seen by downstream + by the Instana httpd sensor) becomes the
+    #  real client IP instead of the LB pod IP.
+    # ============================================================================
+    RemoteIPHeader X-Forwarded-For
+    # Trust ONLY the upstream proxies, i.e. the in-cluster POD network. The TCP
+    # peer that connects to Apache is always the nginx LB pod (10.244.x.x), so
+    # that is the only thing we strip. Everything left of it in X-Forwarded-For
+    # is "untrusted" -> the left-most such address is taken as the real client.
+    #
+    # CAUTION: do NOT add your client's own LAN subnet (here 192.168.0.0/16) to
+    # this list. If you trust the subnet the client lives in, mod_remoteip will
+    # treat the client as a proxy and strip it, and you lose the client IP.
+    #
+    # We use RemoteIPInternalProxy (NOT RemoteIPTrustedProxy) on purpose:
+    #   * RemoteIPTrustedProxy   -> will REFUSE to promote a private/RFC1918
+    #                               address (10/172.16/192.168) to "client".
+    #   * RemoteIPInternalProxy  -> trusts the proxy AND allows a private client
+    #                               address to be used.
+    # In this lab the real client reaches the cluster as a private LAN/VPN
+    # address (192.168.178.130), so RemoteIPInternalProxy is required for Apache
+    # itself to log/trace the real client. (If your clients are public Internet
+    # IPs, RemoteIPTrustedProxy works too.)
+    RemoteIPInternalProxy 10.244.0.0/16
+
+    # Access log that prints the corrected client IP (%a) next to the raw header,
+    # so you can confirm the behaviour from `kubectl logs` as well as in Instana.
+    LogFormat "client=%a  xff=\"%{X-Forwarded-For}i\"  \"%r\"  %>s" xff
+    CustomLog /proc/self/fd/1 xff
+
+    # --- 2. Reverse proxy to the helloworld service ---
+    ProxyPreserveHost On
+    ProxyAddHeaders On
+    # mod_proxy_http AUTOMATICALLY appends the (now-corrected) client IP to
+    # X-Forwarded-For when it forwards the request to helloworld. Because
+    # mod_remoteip already set the client to the real IP, helloworld receives
+    # X-Forwarded-For: <real-client>.
+    ProxyPass        /  http://helloworld.xff-test.svc.cluster.local:3000/
+    ProxyPassReverse /  http://helloworld.xff-test.svc.cluster.local:3000/
+
+    # Also pass an explicit X-Real-IP = corrected client IP (handy / belt-and-braces).
+    RequestHeader set X-Real-IP "expr=%{REMOTE_ADDR}"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: apache
+  namespace: xff-test
+  labels: { app: apache }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: apache }
+  template:
+    metadata:
+      labels: { app: apache }
+    spec:
+      containers:
+        - name: apache
+          image: httpd:2.4
+          # Append our Include to the stock config, then run httpd in foreground.
+          command: ["/bin/sh", "-c"]
+          args:
+            - >
+              echo 'Include conf/extra/proxy-xff.conf' >> /usr/local/apache2/conf/httpd.conf &&
+              httpd-foreground
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: conf
+              mountPath: /usr/local/apache2/conf/extra/proxy-xff.conf
+              subPath: proxy-xff.conf
+      volumes:
+        - name: conf
+          configMap:
+            name: apache-conf
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: apache
+  namespace: xff-test
+  labels: { app: apache }
+spec:
+  selector: { app: apache }
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80

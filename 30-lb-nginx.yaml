@@ -1,0 +1,71 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lb-nginx-conf
+  namespace: xff-test
+data:
+  default.conf: |
+    server {
+      listen 80;
+      # Behaves like a real L7 load balancer (F5 / HAProxy / cloud ALB):
+      # it sets X-Forwarded-For to the connecting client's address.
+      # $proxy_add_x_forwarded_for = (existing XFF, if any) + $remote_addr.
+      # Since this is the edge, that is just the real client IP.
+      location / {
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_pass http://apache.xff-test.svc.cluster.local:80;
+      }
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lb-nginx
+  namespace: xff-test
+  labels: { app: lb-nginx }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: lb-nginx }
+  template:
+    metadata:
+      labels: { app: lb-nginx }
+    spec:
+      containers:
+        - name: nginx
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 80
+          volumeMounts:
+            - name: conf
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+      volumes:
+        - name: conf
+          configMap:
+            name: lb-nginx-conf
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lb-nginx
+  namespace: xff-test
+  labels: { app: lb-nginx }
+  annotations:
+    # Pin a free MetalLB address (pool public-ips = .214-.220, .215 is in use).
+    metallb.universe.tf/loadBalancerIPs: "192.168.178.216"
+spec:
+  type: LoadBalancer
+  # ---- IMPORTANT: preserve the real client source IP ----
+  # With the default (Cluster) policy, kube-proxy SNATs the source to a node IP,
+  # so nginx would record a node IP as the client. "Local" keeps the original
+  # client IP, which then flows through the whole X-Forwarded-For chain.
+  externalTrafficPolicy: Local
+  selector: { app: lb-nginx }
+  ports:
+    - name: http
+      port: 80
+      targetPort: 80
