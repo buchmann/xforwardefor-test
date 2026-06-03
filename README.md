@@ -101,6 +101,7 @@ downstream receives `X-Forwarded-For: <real-client>`.
 | `10-helloworld.yaml` | Node.js echo app + `INSTANA_EXTRA_HTTP_HEADERS` |
 | `20-apache.yaml`    | **Apache reverse proxy — the key config** |
 | `30-lb-nginx.yaml`  | nginx L7 LB + MetalLB LoadBalancer (`192.168.178.216`, `externalTrafficPolicy: Local`) |
+| `40-apache-direct.yaml` | **Test B:** Apache as the *direct edge* proxy, no L7 LB (`192.168.178.217`); proves mod_proxy alone sets XFF + strips spoofed XFF |
 
 ## Deploy
 
@@ -121,6 +122,29 @@ curl -s http://192.168.178.216/hello | grep -E 'clientIp|xForwardedFor'
 kubectl -n xff-test logs deploy/apache -c apache | tail
 #   client=192.168.178.130  xff="-"  "GET /hello HTTP/1.0"  200
 ```
+
+## Test B — Apache as edge, NO load balancer (`40-apache-direct.yaml`)
+
+A second path where the client hits Apache **directly** (no nginx L7 tier). The
+L4 `Service` (`192.168.178.217`) only forwards TCP; Apache is the edge proxy and
+sets `X-Forwarded-For` itself. No `mod_remoteip` needed (no inbound XFF to read).
+The edge setting `RequestHeader unset X-Forwarded-For early` discards any
+client-supplied XFF so it can't be spoofed.
+
+```bash
+# Normal request -> helloworld receives the real client IP
+curl -s http://192.168.178.217/ | grep -E 'clientIp|xForwardedFor'
+#   "xForwardedFor": "192.168.178.130"   "clientIp": "192.168.178.130"
+
+# Spoof attempt -> the fake header is stripped, real client still forwarded
+curl -s -H "X-Forwarded-For: 1.2.3.4" http://192.168.178.217/ | grep -E 'clientIp|xForwardedFor'
+#   "xForwardedFor": "192.168.178.130"   (1.2.3.4 discarded)
+```
+
+Verified 2026-06-02: both return `192.168.178.130`; apache-direct log shows
+`client=192.168.178.130  xff-in="-"`. Key difference vs Test A: at the edge,
+`mod_proxy` (`ProxyAddHeaders On`) is what sets XFF — `mod_remoteip` is only
+needed when there is an upstream proxy whose XFF must be interpreted.
 
 ## See it in Instana
 
